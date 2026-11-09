@@ -9,6 +9,9 @@
 package com.horcrux.svg;
 
 import android.annotation.SuppressLint;
+import android.content.Context;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -19,6 +22,7 @@ import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.util.Base64;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import com.facebook.react.bridge.Dynamic;
@@ -116,9 +120,41 @@ public class SvgView extends ReactViewGroup implements ReactCompoundView, ReactC
     mRemovalTransitionStarted = true;
   }
 
+  // Opt-in, per app: <meta-data android:name="com.horcrux.svg.drawShapesAsVectors"
+  // android:value="true" /> in the application tag of AndroidManifest.xml.
+  // On: plain shapes are recorded into the hardware display list instead of a
+  // rasterized bitmap, and a detached SvgView keeps its bitmap for reattach.
+  // Fewer texture uploads and less memory for many small icons; measure lists
+  // that scroll many icons, where replaying the vectors every frame can cost
+  // more on the RenderThread than drawing cached bitmaps.
+  private static final String DRAW_SHAPES_AS_VECTORS = "com.horcrux.svg.drawShapesAsVectors";
+  private static Boolean sDrawShapesAsVectors;
+
+  private static boolean drawShapesAsVectors(Context context) {
+    if (sDrawShapesAsVectors == null) {
+      boolean enabled = false;
+      try {
+        ApplicationInfo info =
+            context
+                .getPackageManager()
+                .getApplicationInfo(context.getPackageName(), PackageManager.GET_META_DATA);
+        enabled = info.metaData != null && info.metaData.getBoolean(DRAW_SHAPES_AS_VECTORS, false);
+      } catch (PackageManager.NameNotFoundException ignored) {
+        // Own package: always found.
+      }
+      sDrawShapesAsVectors = enabled;
+    }
+    return sDrawShapesAsVectors;
+  }
+
   @Override
   protected void onDetachedFromWindow() {
     super.onDetachedFromWindow();
+    if (drawShapesAsVectors(getContext())) {
+      // A screen that is detached and attached again would otherwise
+      // rasterize every SVG again; an unmounted view's bitmap is freed with it.
+      return;
+    }
     if (mBitmap != null) {
       mBitmap.recycle();
     }
@@ -131,6 +167,19 @@ public class SvgView extends ReactViewGroup implements ReactCompoundView, ReactC
       return;
     }
     super.onDraw(canvas);
+    // Gradients, masks, patterns, clip paths and markers drew wrong this way:
+    // those SVGs keep the bitmap.
+    if (canvas.isHardwareAccelerated()
+        && toDataUrlTask == null
+        && drawShapesAsVectors(getContext())
+        && !hasDefinitions(this)) {
+      // drawChildren applies the viewBox transform and a clip: restore it so
+      // foreground and overlay drawing do not inherit the SVG's coordinates.
+      int saved = canvas.save();
+      drawChildren(canvas);
+      canvas.restoreToCount(saved);
+      return;
+    }
     if (mBitmap == null) {
       mBitmap = drawOutput();
     }
@@ -148,6 +197,19 @@ public class SvgView extends ReactViewGroup implements ReactCompoundView, ReactC
         toDataUrlTask = null;
       }
     }
+  }
+
+  private static boolean hasDefinitions(ViewGroup group) {
+    for (int i = 0; i < group.getChildCount(); i++) {
+      View child = group.getChildAt(i);
+      if (child instanceof DefinitionView
+          || child instanceof MaskView
+          || child instanceof ClipPathView
+          || child instanceof PatternView
+          || child instanceof MarkerView) return true;
+      if (child instanceof ViewGroup && hasDefinitions((ViewGroup) child)) return true;
+    }
+    return false;
   }
 
   private Runnable toDataUrlTask = null;
